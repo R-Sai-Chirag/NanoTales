@@ -1,0 +1,27 @@
+# Model weights and checkpoints
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.ckpt
+*.model
+
+# Training logs
+runs/
+logs/
+wandb/
+
+# Datasets and caches
+*.json
+*.txt
+*.csv
+*.arrow
+*.parquet
+.cache/
+
+# Python environments
+__pycache__/
+venv/
+env/
+nanotales/
+.env
