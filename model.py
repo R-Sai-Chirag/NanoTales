@@ -5,14 +5,37 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from config import GPTConfig
 
-class LayerNorm(nn.Module):
-    def __init__(self,d_model,bias):
+class RMSNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-5):
         super().__init__()
-        self.weights=nn.Parameter(torch.ones(d_model))
-        self.bias=nn.Parameter(torch.zeros(d_model))
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
 
-    def forward(self,x):
-        return F.layer_norm(x,self.weights.shape,self.weights,self.bias,1e-5)
+    def forward(self, x):
+        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
+        return x / rms * self.weight
+    
+class RotaryPositionalEncoding(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.block_size = config.block_size
+        head_dim = config.d_model // config.n_head         
+        theta = 1.0 / (10000 ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        positions = torch.arange(0, config.block_size)
+        freqs = positions.unsqueeze(1) * theta.unsqueeze(0)
+        self.register_buffer("freqs_cis", torch.polar(torch.ones_like(freqs), freqs))  # ← fix 2
+
+    def forward(self, x):
+        # x shape: [batch, n_head, seq_len, head_dim]
+        seq_len = x.shape[2]
+        x_complex = torch.view_as_complex(                   
+            x.float().reshape(*x.shape[:-1], -1, 2)
+        )
+        freqs_cis = self.freqs_cis[:seq_len, :].unsqueeze(0).unsqueeze(0)  # [1,1,seq_len,head_dim//2]
+        x_rotated = x_complex * freqs_cis
+        x_rotated = torch.view_as_real(x_rotated).flatten(3)
+        return x_rotated.type_as(x)
+
     
 class MultiHeadAttention(nn.Module):
     def __init__(self,config):
@@ -26,6 +49,7 @@ class MultiHeadAttention(nn.Module):
         self.bias=config.bias
         self.c_attn=nn.Linear(self.d_model,self.d_model*3,bias=self.bias)
         self.c_proj=nn.Linear(self.d_model,self.d_model,bias=self.bias)
+        self.rope=RotaryPositionalEncoding(config) if config.use_rope else None
 
         self.flash=hasattr(F,"scaled_dot_product_attention")
 
@@ -41,6 +65,10 @@ class MultiHeadAttention(nn.Module):
         q=q.view(B,T,self.n_head,self.head_dim).transpose(1,2)
         k=k.view(B,T,self.n_head,self.head_dim).transpose(1,2)
         v=v.view(B,T,self.n_head,self.head_dim).transpose(1,2)
+
+        if self.rope is not None:
+            q=self.rope(q)
+            k=self.rope(k)
 
         if self.flash:
             y=F.scaled_dot_product_attention(q,k,v,
@@ -72,10 +100,10 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self,config):
         super().__init__()
-        self.ln1=LayerNorm(config.d_model,config.bias)
+        self.ln1=RMSNorm(config.d_model)
         self.att=MultiHeadAttention(config)
         self.mlp=MLP(config)
-        self.ln2=LayerNorm(config.d_model,config.bias)
+        self.ln2=RMSNorm(config.d_model)
     
     def forward(self, x):
         x = x + self.att(self.ln1(x))   
@@ -89,11 +117,11 @@ class GPT(nn.Module):
         
         self.transformer=nn.ModuleDict(dict(
             wte=nn.Embedding(config.vocab_size,config.d_model),
-            wpe=nn.Embedding(config.block_size,config.d_model),
             dropout=nn.Dropout(config.dropout),
             h=nn.ModuleList([Block(config=config) for _ in range(config.n_layer)]),
-            ln_f=LayerNorm(config.d_model,config.bias)
+            ln_f=RMSNorm(config.d_model)
         ))
+        self.wpe=nn.Embedding(config.block_size,config.d_model) if not config.use_rope else None
 
         self.lm_head=nn.Linear(config.d_model,config.vocab_size,bias=False)
         self.transformer.wte.weight=self.lm_head.weight
@@ -119,12 +147,16 @@ class GPT(nn.Module):
         b,t=idx.size()
 
         assert t<=self.config.block_size,f"Sequence {t} > block_size {self.config.block_size}"
-        pos=torch.arange(0,t,dtype=torch.long,device=device)
 
-        tok_emb=self.transformer.wte(idx)
-        pos_emb=self.transformer.wpe(pos)
-
-        x=self.transformer.dropout(tok_emb+pos_emb)
+        if not self.config.use_rope:
+            pos=torch.arange(0,t,dtype=torch.long,device=device)
+            tok_emb=self.transformer.wte(idx)
+            pos_emb=self.wpe(pos)
+            x=self.transformer.dropout(tok_emb+pos_emb)
+        
+        else:
+            tok_emb=self.transformer.wte(idx)
+            x=self.transformer.dropout(tok_emb)
 
         for block in self.transformer.h:
             x=block(x)

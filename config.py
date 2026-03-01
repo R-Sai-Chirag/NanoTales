@@ -9,6 +9,7 @@ class GPTConfig:
     block_size:int=256
     dropout:float=0.1
     bias:bool=True
+    use_rope:bool=True
 
 @dataclass
 class TrainConfig:
@@ -27,7 +28,7 @@ class TrainConfig:
     max_iters:int=100000
     eval_interval:int=500#calculate val loss for every 500 trainig steps.
     eval_iters:int=100#calculate val loss every 100 steps.
-    save_interval:int=1000#saves the model weights every 1000 steps.
+    save_interval:int=10000#saves the model weights every 1000 steps.
     log_interval:int=500
     block_size:int=256
 
@@ -35,4 +36,4 @@ class TrainConfig:
     dtype:str="bfloat16"
     compile:bool=False
 
-    out_dir:str="checkpoints"
+    out_dir:str="checkpoints_rope"
