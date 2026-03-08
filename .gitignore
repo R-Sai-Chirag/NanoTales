@@ -4,20 +4,23 @@
 *.safetensors
 *.bin
 *.ckpt
-*.model
+
+# Checkpoint directories explicitly
+checkpoints*/
 
 # Training logs
 runs/
 logs/
 wandb/
 
-# Datasets and caches
-*.json
-*.txt
-*.csv
-*.arrow
-*.parquet
-.cache/
+# Datasets (raw data, not vocab)
+data/tinystories/*.arrow
+data/tinystories/*.parquet
+data/tinystories/train.txt
+data/tinystories/val.txt
+
+# Vocab — DO NOT ignore, keep in repo
+# vocab.json
 
 # Python environments
 __pycache__/
@@ -25,3 +28,16 @@ venv/
 env/
 nanotales/
 .env
+```
+
+---
+
+## Key Changes
+```
+checkpoints*/     →  explicitly ignores checkpoints_rope,
+                     checkpoints_gqa_rope, checkpoints_v2 etc
+                     without needing to list each one
+
+*.json removed    →  vocab.json will now be committed
+*.txt tightened   →  only ignores the actual dataset txt files
+                     not any other txt files you might add

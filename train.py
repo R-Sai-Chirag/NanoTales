@@ -77,8 +77,12 @@ def train():
     
 
     model=GPT(model_config).to(device)
+
+    if model.config.use_rope and model.config.use_gqa:
+        print(f"[NanoTales] Compiling model with RoPE and GQA... {model.config.n_groups}")
+        
     if train_config.compile:
-        print("[NanoTales] Compiling model...")
+        print("[NanoTales] Compiling base model...")
         model=torch.compile(model)
 
     optimizer=configure_optimizer(model,train_config)
@@ -104,7 +108,7 @@ def train():
             X,y=get_batch("train",train_config)
 
             with ctx:
-                logits,loss=model(X,y)
+                logits,loss,_=model(X,y)
                 loss=loss/train_config.gradient_accumulation_steps
 
 
@@ -148,7 +152,7 @@ def save_checkpoint(model, optimizer, scheduler, step, loss, config, name):
         "scheduler":    scheduler.state_dict(),
         "step":         step,
         "loss":         loss,
-        "model_config": GPTConfig().__dict__,
+        "model_config": model.config.__dict__,
     }
 
     path = Path(config.out_dir) / f"{name}.pt"

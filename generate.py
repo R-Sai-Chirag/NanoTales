@@ -1,16 +1,17 @@
 import json
+import time
 from pathlib import Path
 from model import GPT
 from config import GPTConfig
 import torch
 
-CHECKPOINT="checkpoints/best.pt"
+CHECKPOINT="checkpoints_gqa_rope/best.pt"
 VOCAB_PATH="data/tinystories/vocab.json"
-PROMPT="Lily did not want to share her toys"
-MAX_TOKENS=200
+PROMPT="One morning the toys came to life"
+MAX_TOKENS=240
 TOP_K=40
-NUM_STORIES=3
-TEMPERATURE=0.9
+NUM_STORIES=6
+TEMPERATURE=0.8
 
 def load_vocab(path):
     with open(path,mode="r",encoding="utf-8") as f:
@@ -60,7 +61,7 @@ def load_model(checkpoint_path):
 
     return model, device
 
-def generate_story(model, device, token_to_id, id_to_token, prompt, max_tokens, temperature, top_k):
+def generate_story(model, device, token_to_id, id_to_token, prompt, max_tokens, temperature, top_k,use_kv_cache):
     # encode prompt
     prompt_ids = encode(prompt, token_to_id)
     if len(prompt_ids) == 0:
@@ -71,7 +72,7 @@ def generate_story(model, device, token_to_id, id_to_token, prompt, max_tokens, 
 
 
     with torch.no_grad():
-        output = model.generate(idx, max_new_tokens=max_tokens, temperature=temperature, top_k=top_k)
+        output = model.generate(idx, max_new_tokens=max_tokens, temperature=temperature, top_k=top_k,use_kv_cache=use_kv_cache)
 
     generated_ids = output[0].tolist()
     story = decode(generated_ids, id_to_token)
@@ -82,21 +83,33 @@ def main():
     token_to_id, id_to_token = load_vocab(VOCAB_PATH)
     print(f"[NanoTales] Vocab size: {len(token_to_id):,} tokens")
 
-    print(f"[NanoTales] Loading model from {CHECKPOINT}...")
     model, device = load_model(CHECKPOINT)
+
+    if model.config.use_rope and model.config.use_gqa:
+        print(f"[NanoTales_GQA_ROPE] ...")
+    elif model.config.use_rope:
+        print(f"[NanoTales_ROPE] ...")
+    else:
+        print(f"[NanoTales_BASE] ...")
 
     print(f"\n[NanoTales] Prompt: '{PROMPT}'")
     print(f"[NanoTales] Generating {NUM_STORIES} stories...\n")
     print("=" * 60)
 
     for i in range(NUM_STORIES):
+        t1=time.time()
         story = generate_story(
             model, device,
             token_to_id, id_to_token,
-            PROMPT, MAX_TOKENS, TEMPERATURE, TOP_K
+            PROMPT, MAX_TOKENS, TEMPERATURE, TOP_K,
+            use_kv_cache=True
         )
+        t2=time.time()
+        elapsed=t2-t1
+        tokens_per_sec=MAX_TOKENS/elapsed
         print(f"\nStory {i+1}:\n")
         print(story)
+        print(f"\n{MAX_TOKENS} tokens generated in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
         print("\n" + "=" * 60)
 
 
