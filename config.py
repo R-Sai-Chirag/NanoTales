@@ -6,7 +6,7 @@ class GPTConfig:
     n_head:int=8
     n_layer:int=9
     d_model:int=512
-    block_size:int=256
+    block_size:int=512
     dropout:float=0.1
     bias:bool=False
     use_rope:bool=True
@@ -17,25 +17,27 @@ class GPTConfig:
 class TrainConfig:
     data_dir:str="data/tinystories"
 
-    batch_size:int=16
+    batch_size:int=12
     learning_rate:float=3e-4
+    muon_learning_rate:float=0.005
+    min_lr_ratio:float=0.1
     min_lr:float=1e-5
     weight_decay:float = 0.1
     beta1:float=0.9
     beta2:float=0.95
     grad_clip:float=1.0
-    gradient_accumulation_steps:int = 8
+    gradient_accumulation_steps:int = 16
 
-    warmup_steps:int=200
-    max_iters:int=100000
-    eval_interval:int=500#calculate val loss for every 500 trainig steps.
+    warmup_steps:int=500
+    max_iters:int=33333
+    eval_interval:int=167#calculate val loss for every 167 trainig steps.
     eval_iters:int=100#calculate val loss for 100 steps.
     save_interval:int=10000#saves the model weights every 10,000 steps.
-    log_interval:int=500
-    block_size:int=256
+    log_interval:int=167
+    block_size:int=512
 
     device:str="cuda"
     dtype:str="bfloat16"
     compile:bool=False
 
-    out_dir:str="checkpoints_gqa_rope"
+    out_dir:str="checkpoints_muon"

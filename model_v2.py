@@ -171,24 +171,29 @@ class GroupQueryAttention(nn.Module):
                 f"head_dim={self.head_dim}, heads_per_group={self.heads_per_group}, "
                 f"d_model={self.d_model}, kv_dim={self.kv_dim}")
     
-    
-class MLP(nn.Module):
+
+
+class SwiGLU(nn.Module):
     def __init__(self,config):
         super().__init__()
-        self.c_fc=nn.Linear(config.d_model,4*config.d_model,bias=config.bias)
-        self.c_proj=nn.Linear(4*config.d_model,config.d_model,bias=config.bias)
-        self.act=nn.GELU()
-        self.dropout=nn.Dropout(config.dropout)
+        self.w_up=nn.Linear(config.d_model,(config.d_model*8)//3,bias=config.bias)
+        self.w_gate=nn.Linear(config.d_model,(config.d_model*8)//3,bias=config.bias)
+        self.w_down=nn.Linear((config.d_model*8)//3,config.d_model,bias=config.bias)
+        self.silu=nn.SiLU()
 
     def forward(self,x):
-        return self.dropout(self.c_proj(self.act(self.c_fc(x))))
+        activations=self.silu(self.w_gate(x))
+        representations=self.w_up(x)
+        return self.w_down(activations*representations)
+    
+    
     
 class Block(nn.Module):
     def __init__(self,config):
         super().__init__()
         self.ln1=RMSNorm(config.d_model)
         self.att=GroupQueryAttention(config) if config.use_gqa else MultiHeadAttention(config)
-        self.mlp=MLP(config)
+        self.mlp=SwiGLU(config)
         self.ln2=RMSNorm(config.d_model)
     
     def forward(self, x,past_kv=None,use_cache=False):
@@ -201,7 +206,7 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln2(x))   
         return x,present_kv
     
-class GPT(nn.Module):
+class GPT2(nn.Module):
     def __init__(self,config):
         super().__init__()
         self.config=config
@@ -288,7 +293,7 @@ class GPT(nn.Module):
                     print(f"[Cache] step {step} | cache_len={cache_len} | input_len={current_input.shape[1]}")
 
             logits = logits[:, -1, :] / temperature
-            if top_k is not None and past_kvs[0] is not None:
+            if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float("-inf")
 
@@ -301,4 +306,3 @@ class GPT(nn.Module):
     
     def get_num_params(self):
         return sum(p.numel() for p in self.parameters())
-    

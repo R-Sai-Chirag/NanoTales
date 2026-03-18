@@ -2,16 +2,18 @@ import json
 import time
 from pathlib import Path
 from model import GPT
+from model_v2 import GPT2
 from config import GPTConfig
 import torch
 
-CHECKPOINT="checkpoints_gqa_rope/best.pt"
+CHECKPOINT="checkpoints_muon/best.pt"
 VOCAB_PATH="data/tinystories/vocab.json"
-PROMPT="One morning the toys came to life"
-MAX_TOKENS=240
+PROMPT="One day Lilly found a glowing door in the forest"
+MAX_TOKENS=492
 TOP_K=40
 NUM_STORIES=6
 TEMPERATURE=0.8
+USE_KV_CACHE=True
 
 def load_vocab(path):
     with open(path,mode="r",encoding="utf-8") as f:
@@ -50,7 +52,18 @@ def load_model(checkpoint_path):
 
 
     model_config = GPTConfig(**checkpoint["model_config"])
-    model = GPT(model_config).to(device)
+
+    CHECKPOINT = torch.load(checkpoint_path, map_location=device)
+
+    version = CHECKPOINT.get("model_version", "1.0")
+
+    if version == "2.0":
+        print("[NanoTales] Detected v2.0 — SwiGLU + Muon config")
+        model = GPT2(model_config).to(device)
+    else:
+        print("[NanoTales] Detected v1.0 — standard config")
+        model = GPT(model_config).to(device)
+
 
     model.load_state_dict(checkpoint["model"])
     model.eval()
@@ -58,6 +71,7 @@ def load_model(checkpoint_path):
     print(f"[NanoTales] Loaded checkpoint from step {checkpoint['step']}")
     print(f"[NanoTales] Val loss at checkpoint: {checkpoint['loss']:.4f}")
     print(f"[NanoTales] Running on: {device}")
+    
 
     return model, device
 
@@ -84,7 +98,7 @@ def main():
     print(f"[NanoTales] Vocab size: {len(token_to_id):,} tokens")
 
     model, device = load_model(CHECKPOINT)
-
+    
     if model.config.use_rope and model.config.use_gqa:
         print(f"[NanoTales_GQA_ROPE] ...")
     elif model.config.use_rope:
@@ -102,7 +116,7 @@ def main():
             model, device,
             token_to_id, id_to_token,
             PROMPT, MAX_TOKENS, TEMPERATURE, TOP_K,
-            use_kv_cache=True
+            use_kv_cache=USE_KV_CACHE
         )
         t2=time.time()
         elapsed=t2-t1

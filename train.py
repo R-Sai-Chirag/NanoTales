@@ -6,10 +6,26 @@ import time
 import torch
 from pathlib import Path
 from contextlib import nullcontext
-from torch.optim.lr_scheduler import LinearLR,CosineAnnealingLR,SequentialLR
-from model import GPT
+from model_v2 import GPT2
 from config import GPTConfig,TrainConfig
 from tqdm.auto import tqdm
+from muon import MuonWithAuxAdam
+
+
+import os
+os.environ["MASTER_ADDR"] = "localhost"
+os.environ["MASTER_PORT"] = "29500"
+
+import torch
+import torch.distributed as dist
+
+if not dist.is_initialized():
+    dist.init_process_group(
+        backend="gloo",
+        store=dist.FileStore("tmp_dist_store", 1),
+        world_size=1,
+        rank=0
+    )
 
 _MEMMAP_CACHE={}
 def get_batch(split,config):
@@ -40,26 +56,35 @@ def get_batch(split,config):
     return x,y
 
 def configure_optimizer(model,config):
-    decay_params=[ p for n,p in model.named_parameters() if p.dim()>=2]
-    nondecay_params=[ p for n,p in model.named_parameters() if p.dim()<2]
+    hidden_parameters=[p for n,p in model.named_parameters()
+                       if p.ndim>=2
+                       and "lm_head" not in n
+                       and "wte" not in n]
+    
+    hidden_biases=[p for n,p in model.named_parameters()
+                   if p.ndim<2]
+    
+    non_hidden=[*model.transformer.wte.parameters()]
 
-    params_group=[
-        {"params":decay_params,"weight_decay":config.weight_decay},
-        {"params":nondecay_params,"weight_decay":0.0}
+    params_groups=[
+        dict(params=hidden_parameters , use_muon=True, lr=config.muon_learning_rate , weight_decay=config.weight_decay),
+        dict(params=hidden_biases+non_hidden , use_muon=False, lr=config.learning_rate, betas=(config.beta1, config.beta2), weight_decay=0.0)
     ]
 
-    optimizer=torch.optim.AdamW(params_group,lr=config.learning_rate,betas=(config.beta1,config.beta2))
+    optimizer=MuonWithAuxAdam(param_groups=params_groups)
 
     return optimizer
 
-def configure_scheduler(optimizer,config):
-    warmup=LinearLR(optimizer,start_factor=1e-8,end_factor=1,total_iters=config.warmup_steps)
+def get_lr(step, config):
+    # Phase 1 — warmup
+    if step < config.warmup_steps:
+        return step / config.warmup_steps
 
-    decay=CosineAnnealingLR(optimizer,eta_min=config.min_lr,T_max=config.max_iters-config.warmup_steps)
+    # Phase 2 — cosine decay
+    progress = (step - config.warmup_steps) / (config.max_iters - config.warmup_steps)
+    coeff = 0.5 * (1 + math.cos(math.pi * progress))
+    return config.min_lr_ratio + (1 - config.min_lr_ratio) * coeff
 
-    scheduler=SequentialLR(optimizer,schedulers=[warmup,decay],milestones=[config.warmup_steps])
-
-    return scheduler
 
 def train():
     model_config=GPTConfig()
@@ -76,17 +101,16 @@ def train():
         ctx=nullcontext()
     
 
-    model=GPT(model_config).to(device)
+    model=GPT2(model_config).to(device)
 
     if model.config.use_rope and model.config.use_gqa:
-        print(f"[NanoTales] Compiling model with RoPE and GQA... {model.config.n_groups}")
+        print(f"[NanoTales] Model: RoPE + RMSNorm + MLA + SwiGLU | layers={model.config.n_layer} | d_model={model.config.d_model}")
         
     if train_config.compile:
         print("[NanoTales] Compiling base model...")
         model=torch.compile(model)
 
     optimizer=configure_optimizer(model,train_config)
-    scheduler=configure_scheduler(optimizer,train_config)
 
     Path(train_config.out_dir).mkdir(exist_ok=True,parents=True)
 
@@ -116,15 +140,22 @@ def train():
             accum_loss+=loss.item()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(),train_config.grad_clip)
-        optimizer.step()
 
-        scheduler.step()
+        lr_scale=get_lr(step,train_config)
+
+        for group in optimizer.param_groups:
+            if group.get("use_muon",False):
+                group["lr"]=train_config.muon_learning_rate*lr_scale
+            else:
+                group["lr"]=train_config.learning_rate*lr_scale
+
+        optimizer.step()
 
         t1=time.time()
         dt=t1-t0
 
         if step % train_config.log_interval == 0:
-            print(f"step {step:6d} | loss {accum_loss:.4f} | lr {scheduler.get_last_lr()[0]:.6f} | time {dt*1000:.0f}ms")
+            print(f"step {step:6d} | loss {accum_loss:.4f} | muon_lr {train_config.muon_learning_rate * lr_scale:.6f} | adamw_lr {train_config.learning_rate * lr_scale:.6f} | time {dt*1000:.0f}ms")
 
         
         if step%train_config.eval_interval==0 and step!=0:
@@ -135,24 +166,24 @@ def train():
 
             if val_loss<best_val_loss:
                 best_val_loss=val_loss
-                save_checkpoint(model,optimizer,scheduler,step,val_loss,train_config,"best")
+                save_checkpoint(model,optimizer,step,val_loss,train_config,"best")
                 print(f"[NanoTales] Best model saved — val loss {val_loss:.4f}")
 
         
         if step % train_config.save_interval == 0 and step != 0:
-            save_checkpoint(model, optimizer, scheduler, step, accum_loss, train_config, f"step_{step}")
+            save_checkpoint(model, optimizer, step, accum_loss, train_config, f"step_{step}")
 
     print(f"[NanoTales] Training complete. Best val loss: {best_val_loss:.4f}")
     return train_losses,val_losses
 
-def save_checkpoint(model, optimizer, scheduler, step, loss, config, name):
+def save_checkpoint(model, optimizer,step, loss, config, name):
     checkpoint = {
         "model":        model.state_dict(),
         "optimizer":    optimizer.state_dict(),
-        "scheduler":    scheduler.state_dict(),
         "step":         step,
         "loss":         loss,
         "model_config": model.config.__dict__,
+        "model_version":"2.0",
     }
 
     path = Path(config.out_dir) / f"{name}.pt"
@@ -168,7 +199,7 @@ def evaluate(model,config,ctx):
     for k in range(config.eval_iters):
         X,y=get_batch("validation",config)
         with ctx:
-            logits,loss=model(X,y)
+            logits,loss,_=model(X,y)
         losses[k]=loss.item()
 
     val_loss=losses.mean().item()
