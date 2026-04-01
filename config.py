@@ -12,6 +12,8 @@ class GPTConfig:
     use_rope:bool=True
     n_groups:int=4
     use_gqa:bool=True
+    use_mhc:bool=True
+    n_lanes:int=4
 
 @dataclass
 class TrainConfig:

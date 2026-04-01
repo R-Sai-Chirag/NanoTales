@@ -8,10 +8,10 @@ import torch
 
 CHECKPOINT="checkpoints_muon/best.pt"
 VOCAB_PATH="data/tinystories/vocab.json"
-PROMPT="One day Lilly found a glowing door in the forest"
-MAX_TOKENS=492
+PROMPT="Lily was building a tall tower out of blocks. It was the best tower ever. Suddenly, her little brother ran by and knocked the tower over. The blocks fell everywhere. Lily looked at the broken tower and felt very"
+MAX_TOKENS=350
 TOP_K=40
-NUM_STORIES=6
+NUM_STORIES=3
 TEMPERATURE=0.8
 USE_KV_CACHE=True
 

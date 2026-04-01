@@ -15,6 +15,106 @@ class RMSNorm(nn.Module):
         rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
         return x / rms * self.weight
     
+class Sinkhorn_norm(nn.Module):
+    def __init__(self, n_iters:int=3,eps:float=1e-8):
+        super().__init__()
+        self.n_iters=n_iters
+        self.eps=eps
+    
+    def forward(self,x:torch.Tensor)->torch.Tensor:
+        x=x.abs()
+
+        for _ in range(self.n_iters):
+            x=x/(x.sum(dim=-1,keepdim=True) + self.eps)
+            x=x/(x.sum(dim=-2,keepdim=True) + self.eps)
+        
+        return x
+    
+
+class mHC(nn.Module):
+    def __init__(self,config,n_lanes):
+        super().__init__()
+        n,d=n_lanes,config.d_model
+
+        #static part
+        self.b_res=nn.Parameter(torch.eye(n))
+        b_pre_init=torch.zeros(n); b_pre_init[0]=1
+        self.b_pre=nn.Parameter(b_pre_init)
+        b_post_init=torch.zeros(n);b_post_init[0]=1
+        self.b_post=nn.Parameter(b_post_init)
+
+        #learnable scalers
+        self.a_pre=nn.Parameter(torch.zeros(1))
+        self.a_post=nn.Parameter(torch.zeros(1))
+        self.a_res=nn.Parameter(torch.zeros(1))
+
+        #Dynamic part
+        self.w_pre=nn.Linear(d,n,bias=False)
+        self.w_post=nn.Linear(d,n,bias=False)
+        self.w_res=nn.Linear(d,n*n,bias=False)
+
+        self.norm=RMSNorm(d)
+        self.sinkhorn=Sinkhorn_norm(n_iters=5)
+    
+    def get_mappings(self,x_strams:torch.Tensor):
+        B,T,n,d=x_strams.shape
+
+        x_rep=x_strams[:,:,0,:]
+
+        H_res_raw=(self.a_res*torch.tanh(self.w_res(x_rep)).view(B,T,n,n)+self.b_res)
+        H_res=self.sinkhorn(H_res_raw)
+
+        H_pre=(self.a_pre*torch.tanh(self.w_pre(x_rep))+self.b_pre).abs()
+        H_post=(self.a_post*torch.tanh(self.w_post(x_rep))+self.b_post).abs()
+
+        return H_pre,H_post,H_res
+    
+    def compress(self,X_streams:torch.Tensor,H_pre:torch.Tensor)->torch.Tensor:
+        return (H_pre.unsqueeze(-1) @ X_streams).squeeze(2)
+    
+    def update(self,x_streams:torch.Tensor,
+                    h_res:torch.Tensor,
+                    h_post:torch.Tensor,
+                    layer_out:torch.Tensor)->torch.Tensor:
+        residual=h_res @ x_streams
+
+        output=h_post.unsqueeze(-1)*layer_out.unsqueeze(2)
+
+        return residual+output
+    
+
+class mHC_Block(nn.Module):
+    def __init__(self,config):
+        super().__init__()
+        n=config.n_lanes
+        self.att_mhc=mHC(config,n_lanes=n)
+        self.ffn_mhc=mHC(config,n_lanes=n)
+        self.ln1=RMSNorm(config.d_model)
+        self.ln2=RMSNorm(config.d_model)
+        self.mlp=SwiGLU(config)
+        self.attn=GroupQueryAttention(config) if config.use_gqa else MultiHeadAttention(config)
+
+    def forward(self,x_streams:torch.Tensor,past_kv=None,use_cache:bool=True):
+        H_pre_0,H_post_0,H_res_0=self.att_mhc.get_mappings(x_streams)
+        x=self.att_mhc.compress(x_streams,H_pre_0)
+
+        if isinstance(self.attn,GroupQueryAttention):
+            attn_out,present_kv=self.attn(self.ln1(x),past_kv=past_kv,use_cache=use_cache)
+        else:
+            attn_out=self.attn(self.ln1(x))
+            present_kv=None
+        
+        x_streams=self.att_mhc.update(x_streams,H_res_0,H_post_0,attn_out)
+
+        H_pre_1,H_post_1,H_res_1=self.ffn_mhc.get_mappings(x_streams)
+        x=self.ffn_mhc.compress(x_streams,H_pre_1)
+
+        mlp_out=self.mlp(self.ln2(x))
+        x_streams=self.ffn_mhc.update(x_streams,H_res_1,H_post_1,mlp_out)
+
+        return x_streams,present_kv 
+
+    
 class RotaryPositionalEncoding(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -206,7 +306,7 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln2(x))   
         return x,present_kv
     
-class GPT2(nn.Module):
+class GPT3(nn.Module):
     def __init__(self,config):
         super().__init__()
         self.config=config
@@ -214,7 +314,7 @@ class GPT2(nn.Module):
         self.transformer=nn.ModuleDict(dict(
             wte=nn.Embedding(config.vocab_size,config.d_model),
             dropout=nn.Dropout(config.dropout),
-            h=nn.ModuleList([Block(config=config) for _ in range(config.n_layer)]),
+            h=nn.ModuleList([mHC_Block(config) if config.use_mhc else Block(config) for _ in range(config.n_layer)]),
             ln_f=RMSNorm(config.d_model)
         ))
         self.wpe=nn.Embedding(config.block_size,config.d_model) if not config.use_rope else None
@@ -242,10 +342,12 @@ class GPT2(nn.Module):
         device=idx.device
         b,t=idx.size()
 
+
         assert t<=self.config.block_size,f"Sequence {t} > block_size {self.config.block_size}"
 
         if not self.config.use_rope:
-            pos=torch.arange(0,t,dtype=torch.long,device=device)
+            past_len=past_kvs[0][0].shape[2] if (past_kvs is not None and past_kvs[0] is not None) else 0
+            pos=torch.arange(past_len,past_len+t,dtype=torch.long,device=device)
             tok_emb=self.transformer.wte(idx)
             pos_emb=self.wpe(pos)
             x=self.transformer.dropout(tok_emb+pos_emb)
@@ -254,12 +356,23 @@ class GPT2(nn.Module):
             tok_emb=self.transformer.wte(idx)
             x=self.transformer.dropout(tok_emb)
 
+        if self.config.use_mhc:
+            n=self.config.n_lanes
+            x_streams=x.new_zeros(b,t,n,self.config.d_model)
+            x_streams[:,:,0,:]=x
+
+        hidden_states=x_streams if self.config.use_mhc else x
+
         present_kvs=[]
         for i,block in enumerate(self.transformer.h):
             past_kv=past_kvs[i] if past_kvs is not None else None
-            x, present_kv=block(x,use_cache=use_cache,past_kv=past_kv)
+            hidden_states, present_kv=block(hidden_states,use_cache=use_cache,past_kv=past_kv)
             present_kvs.append(present_kv)
 
+        if self.config.use_mhc:
+            x=hidden_states.sum(dim=2)
+        else:
+            x=hidden_states
 
         x=self.transformer.ln_f(x)
 
