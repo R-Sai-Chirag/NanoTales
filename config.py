@@ -40,6 +40,6 @@ class TrainConfig:
 
     device:str="cuda"
     dtype:str="bfloat16"
-    compile:bool=False
+    compile:bool=True
 
-    out_dir:str="checkpoints_muon"
+    out_dir:str="checkpoints_mHC"

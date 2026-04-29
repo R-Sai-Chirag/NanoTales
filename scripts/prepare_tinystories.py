@@ -77,24 +77,25 @@ def build_vocab(ds,vocab_size,num_proc):
     for example in tqdm(tokenized_stories,desc="Counting Tokens"):
         counter.update(example["tokens"])
 
-    most_common=counter.most_common(vocab_size)                                   
+    # --- FIX START ---
+    # Take (vocab_size - 1) to leave room for the explicit EOS token
+    most_common=counter.most_common(vocab_size - 1)                                   
 
     vocab={}
     for new_id,(old_id,count) in enumerate(most_common):
         vocab[old_id]=new_id
 
+    # Explicitly inject the GPT-2 EOS token (50256) at the final index
+    eos_gpt2_id = encoder.eot_token
+    vocab[eos_gpt2_id] = vocab_size - 1
+    # --- FIX END ---
+
     print(f"[NanoTales] Most common token: id={most_common[0][0]}, count={most_common[0][1]:,}")
     print(f"[NanoTales] Least common token: id={most_common[-1][0]}, count={most_common[-1][1]:,}")
+    print(f"[NanoTales] INJECTED EOS token: GPT-2 id={eos_gpt2_id} -> NanoTales id={vocab_size - 1}")
 
     return vocab,encoder,tokenized_stories
 
-'''vocab = {
-    198:  0,      # GPT-2 token 198 becomes NanoTales token 0
-    257:  1,      # GPT-2 token 257 becomes NanoTales token 1
-    320:  2,      # GPT-2 token 320 becomes NanoTales token 2
-    ...
-    8341: 9999    # GPT-2 token 8341 becomes NanoTales token 9999
-}'''
 
 def tokenize_and_remap(story,vocab):
     remapped=[]
@@ -103,7 +104,12 @@ def tokenize_and_remap(story,vocab):
         if token in vocab:
             remapped.append(vocab[token])
 
-    remapped.append(1) #append end of text token
+    # --- FIX START ---
+    # Append the true EOS token using its mapped ID instead of '1'
+    eos_gpt2_id = 50256 # Standard GPT-2 EOS token
+    if eos_gpt2_id in vocab:
+        remapped.append(vocab[eos_gpt2_id])
+    # --- FIX END ---
 
     return {"ids":remapped , "len":len(remapped)}
 
@@ -126,7 +132,6 @@ def write_chunks(tokenised_ds,dir,chunk_size):
             out_dir=dir/f"chunk_{chunk_idx:06d}.bin"
             chunk.tofile(out_dir)
         
-
             buffer=buffer[chunk_size:]
             buffer_len=buffer_len-chunk_size
             chunk_idx+=1

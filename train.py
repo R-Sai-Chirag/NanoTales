@@ -1,4 +1,6 @@
 import os
+os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "0"
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = "./.tc"
 import json
 import numpy as np
 import math
@@ -6,17 +8,19 @@ import time
 import torch
 from pathlib import Path
 from contextlib import nullcontext
-from model_v2 import GPT2
+from model_v3 import GPT3
 from config import GPTConfig,TrainConfig
 from tqdm.auto import tqdm
 from muon import MuonWithAuxAdam
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
-import os
+
+
 os.environ["MASTER_ADDR"] = "localhost"
 os.environ["MASTER_PORT"] = "29500"
 
-import torch
 import torch.distributed as dist
 
 if not dist.is_initialized():
@@ -55,25 +59,31 @@ def get_batch(split,config):
 
     return x,y
 
-def configure_optimizer(model,config):
-    hidden_parameters=[p for n,p in model.named_parameters()
-                       if p.ndim>=2
-                       and "lm_head" not in n
-                       and "wte" not in n]
-    
-    hidden_biases=[p for n,p in model.named_parameters()
-                   if p.ndim<2]
-    
-    non_hidden=[*model.transformer.wte.parameters()]
+def configure_optimizer(model, config):
+    no_decay_names = {"b_res", "b_pre", "b_post", "a_pre", "a_post", "a_res"}
 
-    params_groups=[
-        dict(params=hidden_parameters , use_muon=True, lr=config.muon_learning_rate , weight_decay=config.weight_decay),
-        dict(params=hidden_biases+non_hidden , use_muon=False, lr=config.learning_rate, betas=(config.beta1, config.beta2), weight_decay=0.0)
+    hidden_parameters = [p for n, p in model.named_parameters()
+                         if p.ndim >= 2
+                         and "lm_head" not in n
+                         and "wte" not in n
+                         and not any(nd in n for nd in no_decay_names)]  # ← exclude mHC statics
+
+    hidden_biases = [p for n, p in model.named_parameters()
+                     if p.ndim < 2
+                     and not any(nd in n for nd in no_decay_names)]      # ← exclude mHC statics
+
+    non_hidden = [*model.transformer.wte.parameters()]
+
+    mhc_static = [p for n, p in model.named_parameters()
+                  if any(nd in n for nd in no_decay_names)]
+
+    params_groups = [
+        dict(params=hidden_parameters, use_muon=True, lr=config.muon_learning_rate, weight_decay=config.weight_decay),
+        dict(params=hidden_biases + non_hidden + mhc_static, use_muon=False, lr=config.learning_rate,
+             betas=(config.beta1, config.beta2), weight_decay=0.0),
     ]
 
-    optimizer=MuonWithAuxAdam(param_groups=params_groups)
-
-    return optimizer
+    return MuonWithAuxAdam(param_groups=params_groups)
 
 def get_lr(step, config):
     # Phase 1 — warmup
@@ -101,14 +111,45 @@ def train():
         ctx=nullcontext()
     
 
-    model=GPT2(model_config).to(device)
+    model=GPT3(model_config).to(device)
 
-    if model.config.use_rope and model.config.use_gqa:
-        print(f"[NanoTales] Model: RoPE + RMSNorm + MLA + SwiGLU | layers={model.config.n_layer} | d_model={model.config.d_model}")
+    INIT_FROM = "resume" # Change this to "scratch" if you ever want to train a new model
+
+    if INIT_FROM == "resume":
+        ckpt_path = Path(train_config.out_dir) / "best.pt"
+        print(f"[NanoTales] Resuming from checkpoint: {ckpt_path}")
+        
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        state_dict = checkpoint["model"]
+        
+        # Clean the compiled prefixes just like we did in generate.py
+        unwanted_prefix = '_orig_mod.'
+        for k, v in list(state_dict.items()):
+            if k.startswith(unwanted_prefix):
+                state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
+                
+        model.load_state_dict(state_dict)
+        
+        # Override config for a gentle Fine-Tuning run
+        train_config.max_iters = 3000
+        train_config.warmup_steps = 100
+        train_config.learning_rate = 1e-5             # Much lower than normal AdamW
+        train_config.muon_learning_rate = 0.001       # Scaled down Muon LR
+        
+        print(f"[NanoTales] Overriding Config for SFT: {train_config.max_iters} iters, LR={train_config.learning_rate}")
         
     if train_config.compile:
-        print("[NanoTales] Compiling base model...")
-        model=torch.compile(model)
+        print("Compiling model... (first 3 steps will be slow)")
+        model = torch.compile(
+            model,
+            mode="max-autotune-no-cudagraphs",
+            dynamic=True   # CRITICAL for your mHC dynamic shapes
+        )
+
+
+    if model.config.use_rope and model.config.use_gqa and model.config.use_mhc:
+        print(f"[NanoTales] Model: RoPE + RMSNorm + GQA + SwiGLU + mHC | lanes={model.config.n_lanes} | layers={model.config.n_layer} | d_model={model.config.d_model}")
+        
 
     optimizer=configure_optimizer(model,train_config)
 
@@ -157,12 +198,28 @@ def train():
         if step % train_config.log_interval == 0:
             print(f"step {step:6d} | loss {accum_loss:.4f} | muon_lr {train_config.muon_learning_rate * lr_scale:.6f} | adamw_lr {train_config.learning_rate * lr_scale:.6f} | time {dt*1000:.0f}ms")
 
+            if model_config.use_mhc:
+                block = model.transformer.h[0]          # check first block
+                with torch.no_grad():
+                    # grab a sample batch just to get h_res
+                    X_sample, _ = get_batch("train", train_config)
+                    n = model_config.n_lanes                    # ← n_lanes not n_streams
+                    x_streams = torch.zeros(X_sample.shape[0], X_sample.shape[1], n, model_config.d_model, device=device)
+                    x_streams[:, :, 0, :] = model.transformer.wte(X_sample)
+
+                    H_pre, H_post, H_res = block.mhc.get_mappings(x_streams)  # ← att_mhc, correct unpack order
+                    row_sums = H_res[0, 0].sum(-1)
+                    col_sums = H_res[0, 0].sum(-2)
+                    print(f"  [mHC] H_res row_sums: {row_sums.tolist()}")
+                    print(f"  [mHC] H_res col_sums: {col_sums.tolist()}")
+
         
         if step%train_config.eval_interval==0 and step!=0:
             val_loss=evaluate(model,train_config,ctx)
             val_losses.append(val_loss)
             train_losses.append(accum_loss)
             print(f"[NanoTales] step {step} | val loss {val_loss:.4f}")
+            print()
 
             if val_loss<best_val_loss:
                 best_val_loss=val_loss

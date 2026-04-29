@@ -16,7 +16,7 @@ class RMSNorm(nn.Module):
         return x / rms * self.weight
     
 class Sinkhorn_norm(nn.Module):
-    def __init__(self, n_iters:int=3,eps:float=1e-8):
+    def __init__(self, n_iters:int=2,eps:float=1e-8):
         super().__init__()
         self.n_iters=n_iters
         self.eps=eps
@@ -25,8 +25,8 @@ class Sinkhorn_norm(nn.Module):
         x=x.abs()
 
         for _ in range(self.n_iters):
-            x=x/(x.sum(dim=-1,keepdim=True) + self.eps)
-            x=x/(x.sum(dim=-2,keepdim=True) + self.eps)
+            x=F.softmax(x,dim=-1)
+            x=F.softmax(x,dim=-2)
         
         return x
     
@@ -40,7 +40,7 @@ class mHC(nn.Module):
         self.b_res=nn.Parameter(torch.eye(n))
         b_pre_init=torch.zeros(n); b_pre_init[0]=1
         self.b_pre=nn.Parameter(b_pre_init)
-        b_post_init=torch.zeros(n);b_post_init[0]=1
+        b_post_init = torch.full((n,), 1.0 / n)
         self.b_post=nn.Parameter(b_post_init)
 
         #learnable scalers
@@ -54,12 +54,12 @@ class mHC(nn.Module):
         self.w_res=nn.Linear(d,n*n,bias=False)
 
         self.norm=RMSNorm(d)
-        self.sinkhorn=Sinkhorn_norm(n_iters=5)
+        self.sinkhorn=Sinkhorn_norm(n_iters=2)
     
-    def get_mappings(self,x_strams:torch.Tensor):
-        B,T,n,d=x_strams.shape
+    def get_mappings(self,x_streams:torch.Tensor):
+        B,T,n,d=x_streams.shape
 
-        x_rep=x_strams[:,:,0,:]
+        x_rep=self.norm(x_streams[:,:,0,:])
 
         H_res_raw=(self.a_res*torch.tanh(self.w_res(x_rep)).view(B,T,n,n)+self.b_res)
         H_res=self.sinkhorn(H_res_raw)
@@ -70,7 +70,7 @@ class mHC(nn.Module):
         return H_pre,H_post,H_res
     
     def compress(self,X_streams:torch.Tensor,H_pre:torch.Tensor)->torch.Tensor:
-        return (H_pre.unsqueeze(-1) @ X_streams).squeeze(2)
+        return (H_pre.unsqueeze(-1) * X_streams).sum(dim=2)
     
     def update(self,x_streams:torch.Tensor,
                     h_res:torch.Tensor,
@@ -87,16 +87,15 @@ class mHC_Block(nn.Module):
     def __init__(self,config):
         super().__init__()
         n=config.n_lanes
-        self.att_mhc=mHC(config,n_lanes=n)
-        self.ffn_mhc=mHC(config,n_lanes=n)
+        self.mhc=mHC(config,n_lanes=n)
         self.ln1=RMSNorm(config.d_model)
         self.ln2=RMSNorm(config.d_model)
         self.mlp=SwiGLU(config)
         self.attn=GroupQueryAttention(config) if config.use_gqa else MultiHeadAttention(config)
 
     def forward(self,x_streams:torch.Tensor,past_kv=None,use_cache:bool=True):
-        H_pre_0,H_post_0,H_res_0=self.att_mhc.get_mappings(x_streams)
-        x=self.att_mhc.compress(x_streams,H_pre_0)
+        H_pre_0,H_post_0,H_res_0=self.mhc.get_mappings(x_streams)
+        x=self.mhc.compress(x_streams,H_pre_0)
 
         if isinstance(self.attn,GroupQueryAttention):
             attn_out,present_kv=self.attn(self.ln1(x),past_kv=past_kv,use_cache=use_cache)
@@ -104,13 +103,13 @@ class mHC_Block(nn.Module):
             attn_out=self.attn(self.ln1(x))
             present_kv=None
         
-        x_streams=self.att_mhc.update(x_streams,H_res_0,H_post_0,attn_out)
+        x_streams=self.mhc.update(x_streams,H_res_0,H_post_0,attn_out)
 
-        H_pre_1,H_post_1,H_res_1=self.ffn_mhc.get_mappings(x_streams)
-        x=self.ffn_mhc.compress(x_streams,H_pre_1)
+
+        x=self.mhc.compress(x_streams,H_pre_0)
 
         mlp_out=self.mlp(self.ln2(x))
-        x_streams=self.ffn_mhc.update(x_streams,H_res_1,H_post_1,mlp_out)
+        x_streams=self.mhc.update(x_streams,H_res_0,H_post_0,mlp_out)
 
         return x_streams,present_kv 
 
@@ -204,6 +203,8 @@ class GroupQueryAttention(nn.Module):
         self.c_attn=nn.Linear(config.d_model,config.d_model+2*self.kv_dim,bias=config.bias)
         self.c_proj=nn.Linear(config.d_model,config.d_model,bias=config.bias)
         self.dropout=nn.Dropout(config.dropout)
+        self.q_norm=RMSNorm(self.head_dim)
+        self.k_norm=RMSNorm(self.head_dim)
 
         self.flash=hasattr(F,"scaled_dot_product_attention")
 
@@ -226,6 +227,9 @@ class GroupQueryAttention(nn.Module):
         q=q.view(B,T,self.n_head,self.head_dim).transpose(1,2)
         k=k.view(B,T,self.config.n_groups,self.head_dim).transpose(1,2)
         v=v.view(B,T,self.config.n_groups,self.head_dim).transpose(1,2)
+
+        q=self.q_norm(q)
+        k=self.k_norm(k)
 
         if self.rope:
             q=self.rope(q,curr_pos)
@@ -389,30 +393,35 @@ class GPT3(nn.Module):
             return logits,None,present_kvs if use_cache else None
     
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_kv_cache=True):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_kv_cache=True, eos_id=None):
         past_kvs = None
         current_input = idx
 
         for step in range(max_new_tokens):
             if use_kv_cache:
+  
                 logits, _, past_kvs = self(current_input, use_cache=True, past_kvs=past_kvs)
             else:
                 idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-                logits, _, _ = self(idx_cond, use_cache=False, past_kvs=None)  # ← full sequence every step
+                logits, _, _ = self(idx_cond, use_cache=False, past_kvs=None)
 
-            if step % 50 == 0:
-                if past_kvs is not None and past_kvs[0] is not None:
-                    cache_len = past_kvs[0][0].shape[2]
-                    print(f"[Cache] step {step} | cache_len={cache_len} | input_len={current_input.shape[1]}")
-
+           
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float("-inf")
 
+           
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+
+         
             idx = torch.cat([idx, next_token], dim=1)
+            
+         
+            if eos_id is not None and next_token.item() == eos_id:
+                break
+                
             current_input = next_token
 
         return idx
